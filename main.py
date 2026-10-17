@@ -1,0 +1,269 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from scipy.optimize import minimize
+import statsmodels.api as sm
+import collections
+import datetime
+
+
+tickers = [
+    "C38U.SI","JCI","KRX.IR","TT","6367.T","CARR","NG.L","SU.PA","PRY.MI","NEE",
+    "PWR","ETN","SIE.DE","ABBN.SW","GNRC","DSFIR.AS","MUV2.DE","CTVA","DE","NTR",
+    "TOM.OL","ZURN.SW","WMS","BMI","ITRI","CLH","AWK","SVT.L","VIE.PA","XYL",
+    "STN","AWR","CWT","WTRG","U96.SI","MWA","J","0371.HK","0270.HK","LNN",
+    "NWPX","CWCO","FELE"
+]
+
+benchmark = "ACWI"
+risk_free_annual = 0.04
+risk_free_monthly = risk_free_annual / 12
+start_date = "2010-01-01"
+
+ticker_country = {
+    "C38U.SI": "SG", "JCI": "US", "KRX.IR": "KR", "TT": "US", "6367.T": "JP",
+    "CARR": "US", "NG.L": "UK", "SU.PA": "FR", "PRY.MI": "IT", "NEE": "US",
+    "PWR": "US", "ETN": "US", "SIE.DE": "DE", "ABBN.SW": "CH", "GNRC": "US",
+    "DSFIR.AS": "NL", "MUV2.DE": "DE", "CTVA": "US", "DE": "US", "NTR": "US",
+    "TOM.OL": "NO", "ZURN.SW": "CH", "WMS": "US", "BMI": "US", "ITRI": "US",
+    "CLH": "US", "AWK": "US", "SVT.L": "UK", "VIE.PA": "FR", "XYL": "US",
+    "STN": "US", "AWR": "US", "CWT": "US", "WTRG": "US", "U96.SI": "SG",
+    "MWA": "US", "J": "US", "0371.HK": "HK", "0270.HK": "HK", "LNN": "US",
+    "NWPX": "US", "CWCO": "US", "FELE": "US"
+}
+
+esg_data = {
+    "AWK": {"ESG Rating":"AAA","Rev Pass 50%?":"YES"},
+    "SVT.L": {"ESG Rating":"AAA","Rev Pass 50%?":"YES"},
+    "VIE.PA": {"ESG Rating":"AAA","Rev Pass 50%?":"YES"},
+    "XYL": {"ESG Rating":"AAA","Rev Pass 50%?":"NO"},
+    "STN": {"ESG Rating":"AAA","Rev Pass 50%?":"NO"},
+    "AWR": {"ESG Rating":"AA","Rev Pass 50%?":"YES"},
+    "CWT": {"ESG Rating":"AA","Rev Pass 50%?":"YES"},
+    "WTRG": {"ESG Rating":"AA","Rev Pass 50%?":"YES"},
+    "U96.SI": {"ESG Rating":"AA","Rev Pass 50%?":"YES"},
+    "MWA": {"ESG Rating":"AA","Rev Pass 50%?":"YES"},
+    "J": {"ESG Rating":"AA","Rev Pass 50%?":"NO"},
+    "0371.HK": {"ESG Rating":"A","Rev Pass 50%?":"YES"},
+    "0270.HK": {"ESG Rating":"A","Rev Pass 50%?":"NO"},
+    "LNN": {"ESG Rating":"A","Rev Pass 50%?":"YES"},
+    "NWPX": {"ESG Rating":"A","Rev Pass 50%?":"YES"},
+    "CWCO": {"ESG Rating":"A","Rev Pass 50%?":"YES"},
+    "FELE": {"ESG Rating":"A","Rev Pass 50%?":"NO"},
+}
+
+# DOWNLOAD DAILY DATA FOR LIQUIDITY CHECK
+print("Downloading daily price & volume data for liquidity check...")
+liq_data = yf.download(tickers, start=start_date, interval="1d", auto_adjust=True, progress=False)[["Close","Volume"]]
+
+# compute ADTV
+avg_daily_trading_value = {}
+for ticker in tickers:
+    if ticker in liq_data['Close'].columns:
+        adtv = (liq_data['Close'][ticker] * liq_data['Volume'][ticker]).mean()
+        avg_daily_trading_value[ticker] = adtv
+
+usd_threshold = 1_000_000
+eligible_tickers = [t for t, value in avg_daily_trading_value.items() if value >= usd_threshold]
+tickers = eligible_tickers
+ticker_country = {t: c for t, c in ticker_country.items() if t in tickers}
+print(f"{len(tickers)} stocks eligible after liquidity filter")
+
+#monthly data
+all_tickers = tickers + [benchmark]
+data = yf.download(all_tickers, start=start_date, interval="1mo", auto_adjust=True, progress=False)["Close"]
+data = data.dropna(axis=1, thresh=int(0.7*len(data)))
+returns = data.pct_change().dropna()
+portfolio_returns = returns.drop(columns=[benchmark])
+benchmark_returns = returns[benchmark]
+n = len(portfolio_returns.columns)
+print(f"Using {n} stocks after liquidity filter")
+
+# PORTFOLIO OPTIMIZATION slsqp
+mean_returns = portfolio_returns.mean()
+cov_matrix = portfolio_returns.cov()
+
+def portfolio_stats(weights):
+    port_return = np.dot(weights, mean_returns)
+    port_vol = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
+    sharpe = (port_return - risk_free_monthly)/port_vol
+    return port_return, port_vol, sharpe
+
+def neg_sharpe(weights):
+    return -portfolio_stats(weights)[2]
+
+constraints = [{'type':'eq','fun':lambda x: np.sum(x)-1}]
+for country in set(ticker_country.values()):
+    indices = [i for i,t in enumerate(portfolio_returns.columns) if ticker_country[t]==country]
+    if indices:
+        constraints.append({'type':'ineq','fun':lambda w, idx=indices: 0.399 - sum(w[i] for i in idx)})
+
+bounds = tuple((0.01,0.10) for _ in range(n))
+initial_guess = np.array([1/n]*n)
+result = minimize(neg_sharpe, initial_guess, method='SLSQP', bounds=bounds, constraints=constraints)
+optimal_weights = result.x
+
+#country weightage
+country_weights = collections.defaultdict(float)
+for i, t in enumerate(portfolio_returns.columns):
+    country_weights[ticker_country[t]] += optimal_weights[i]
+
+#metrics
+opt_return_m,opt_vol_m,opt_sharpe_m = portfolio_stats(optimal_weights)
+opt_return_a = opt_return_m*12
+opt_vol_a = opt_vol_m*np.sqrt(12)
+opt_sharpe_a = (opt_return_a-risk_free_annual)/opt_vol_a
+
+portfolio_series = portfolio_returns @ optimal_weights
+X = sm.add_constant(benchmark_returns)
+model = sm.OLS(portfolio_series,X).fit()
+alpha_m = model.params.iloc[0]
+beta = model.params.iloc[1]
+alpha_a = alpha_m*12
+active_return = portfolio_series - benchmark_returns
+info_ratio = (active_return.mean()*12)/(active_return.std()*np.sqrt(12))
+cumulative = (1 + portfolio_series).cumprod()
+rolling_max = cumulative.cummax()
+drawdown = cumulative / rolling_max - 1
+max_drawdown = drawdown.min()
+
+#monte carlo
+num_simulations = 10000
+years = 10
+months = years*12
+sim_results = []
+
+for _ in range(num_simulations):
+    sim_returns = np.random.multivariate_normal(mean_returns, cov_matrix, months)
+    sim_port = sim_returns @ optimal_weights
+    sim_results.append(np.prod(1 + sim_port))
+
+sim_results = np.array(sim_results)
+annualized_results = sim_results**(1/years) - 1
+
+mc_cumulative_summary = {
+    "Mean 10Y Return": sim_results.mean(),
+    "Median 10Y Return": np.median(sim_results),
+    "5th Percentile": np.percentile(sim_results,5),
+    "95th Percentile": np.percentile(sim_results,95)
+}
+
+mc_annualized_summary = {
+    "Mean 10Y Return (Annualized)": annualized_results.mean(),
+    "Median 10Y Return (Annualized)": np.median(annualized_results),
+    "5th Percentile (Annualized)": np.percentile(annualized_results,5),
+    "95th Percentile (Annualized)": np.percentile(annualized_results,95)
+}
+
+# top stocks, countries, method
+weights_df = pd.DataFrame({"Ticker":portfolio_returns.columns,"Weight":optimal_weights}).sort_values(by="Weight",ascending=False)
+top_stocks_df = weights_df.head(5)
+
+country_weights_df = pd.DataFrame(list(country_weights.items()),columns=["Country","Weight"])
+top_countries_df = country_weights_df.sort_values(by="Weight",ascending=False).head(3)
+
+method_explanation = [
+    ["Optimization Method","SLSQP (Sequential Least Squares Programming)"],
+    ["Objective","Maximize portfolio Sharpe ratio"],
+    ["Constraints","Sum of weights=1; stock 1%-10%; country ≤39.9%; ADTV≥$1M/day"],
+    ["Inputs","Historical monthly returns and covariance matrix"],
+    ["Output","Optimal weights that maximize risk-adjusted returns under constraints"]
+]
+method_df = pd.DataFrame(method_explanation,columns=["Concept","Details"])
+
+portfolio_summary = pd.DataFrame({
+    "Metric":["Annual Return","Annual Volatility","Sharpe Ratio","Annual Alpha",
+              "Beta vs ACWI","Information Ratio","Max Drawdown"],
+    "Value":[opt_return_a,opt_vol_a,opt_sharpe_a,alpha_a,beta,info_ratio,max_drawdown]
+})
+
+#country weightage and liquiidity
+country_comp_list = []
+for country in set(ticker_country.values()):
+    indices = [i for i,t in enumerate(portfolio_returns.columns) if ticker_country[t]==country]
+    country_weight = sum(optimal_weights[i] for i in indices)
+    for i in indices:
+        ticker_name = portfolio_returns.columns[i]
+        stock_weight = optimal_weights[i]
+        contribution_pct = stock_weight / country_weight if country_weight>0 else 0
+        country_comp_list.append({
+            "Country":country,
+            "Ticker":ticker_name,
+            "Weight":stock_weight,
+            "Contribution to Country (%)":contribution_pct*100
+        })
+country_weightage_df = pd.DataFrame(country_comp_list).sort_values(by=["Country","Weight"],ascending=[True,False])
+
+liq_list = [{"Ticker":t,"Average Daily Trading Value (ADTV)":avg_daily_trading_value.get(t,np.nan)} for t in tickers]
+liq_df = pd.DataFrame(liq_list).sort_values(by="Average Daily Trading Value (ADTV)",ascending=False)
+
+# ESG-ADJUSTED PORTFOLIO-----------------------------------------
+
+# Define boosts
+esg_rating_boost = {"AAA": 1.15, "AA": 1.10, "A": 1.05}
+climate_rev_boost = {"YES": 1.15, "NO": 1.10}
+
+# Build ESG-adjusted weights safely
+adjusted_weights_list = []
+
+for i, ticker in enumerate(portfolio_returns.columns):
+    base_weight = optimal_weights[i]
+    esg_info = esg_data.get(ticker, {})
+
+    rating_factor = esg_rating_boost.get(esg_info.get("ESG Rating", "A"), 1.05)
+    climate_factor = climate_rev_boost.get(esg_info.get("Rev Pass 50%?", "NO"), 1.10)
+
+    adjusted_weight = base_weight * rating_factor * climate_factor
+    adjusted_weights_list.append(adjusted_weight)
+
+# Convert to writable NumPy array and normalize
+adjusted_weights = np.array(adjusted_weights_list, dtype=float)
+adjusted_weights /= adjusted_weights.sum()  # sum to 1
+
+# Build ESG DataFrame
+esg_df = pd.DataFrame({
+    "Ticker": portfolio_returns.columns,
+    "Original Weight": optimal_weights,
+    "Adjusted Weight": adjusted_weights
+})
+esg_df = esg_df.sort_values(by="Adjusted Weight", ascending=False)
+
+# ESG-ADJUSTED metrics
+
+esg_portfolio_series = portfolio_returns @ adjusted_weights
+
+# Monthly metrics
+esg_return_m = esg_portfolio_series.mean()
+esg_vol_m = esg_portfolio_series.std()
+esg_sharpe_m = (esg_return_m - risk_free_monthly) / esg_vol_m
+
+# Annualized metrics
+esg_return_a = esg_return_m * 12
+esg_vol_a = esg_vol_m * np.sqrt(12)
+esg_sharpe_a = (esg_return_a - risk_free_annual) / esg_vol_a
+
+# ESG metrics summary
+esg_summary_df = pd.DataFrame({
+    "Metric": ["Annual Return", "Annual Volatility", "Sharpe Ratio"],
+    "Value": [esg_return_a, esg_vol_a, esg_sharpe_a]
+})
+
+filename = f"Climate_Adaptation_Portfolio_Results_{datetime.datetime.now():%Y%m%d_%H%M%S}.xlsx"
+
+with pd.ExcelWriter(filename) as writer:
+    data.to_excel(writer, sheet_name="Prices")
+    returns.to_excel(writer, sheet_name="Monthly Returns")
+    weights_df.to_excel(writer, sheet_name="Optimised Weights",index=False)
+    portfolio_summary.to_excel(writer, sheet_name="Portfolio Summary",index=False)
+    mc_data_df = pd.DataFrame({"Cumulative 10Y Return":sim_results,"Annualized 10Y Return":annualized_results})
+    mc_data_df.to_excel(writer, sheet_name="Monte Carlo Data",index=False)
+    top_stocks_df.to_excel(writer, sheet_name="Top 5 Stocks",index=False)
+    top_countries_df.to_excel(writer, sheet_name="Top 3 Countries",index=False)
+    method_df.to_excel(writer, sheet_name="Weightage Method",index=False)
+    country_weightage_df.to_excel(writer, sheet_name="Country Weightage",index=False)
+    liq_df.to_excel(writer, sheet_name="Liquidity",index=False)
+    esg_df.to_excel(writer, sheet_name="ESG Adjusted Weights",index=False)
+    esg_summary_df.to_excel(writer, sheet_name="ESG-Adjusted Portfolio",index=False)
+
+print(f"Excel file saved successfully with all sheets: {filename}")
+print("Done! ESG-adjusted weights and portfolio metrics included.")
